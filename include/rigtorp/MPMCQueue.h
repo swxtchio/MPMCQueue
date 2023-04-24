@@ -30,6 +30,8 @@ SOFTWARE.
 #include <new> // std::hardware_destructive_interference_size
 #include <stdexcept>
 
+#include "ShmAllocator.hpp"
+
 #ifndef __cpp_aligned_new
 #ifdef _WIN32
 #include <malloc.h> // _aligned_malloc
@@ -121,22 +123,33 @@ private:
 public:
   explicit Queue(const size_t capacity,
                  const Allocator &allocator = Allocator())
-      : capacity_(capacity), allocator_(allocator), head_(0), tail_(0) {
+      : capacity_(capacity), allocator_(allocator) {
     if (capacity_ < 1) {
       throw std::invalid_argument("capacity < 1");
     }
     // Allocate one extra slot to prevent false sharing on the last slot
-    slots_ = allocator_.allocate(capacity_ + 1);
-    // Allocators are not required to honor alignment for over-aligned types
-    // (see http://eel.is/c++draft/allocator.requirements#10) so we verify
-    // alignment here
-    if (reinterpret_cast<size_t>(slots_) % alignof(Slot<T>) != 0) {
-      allocator_.deallocate(slots_, capacity_ + 1);
-      throw std::bad_alloc();
+    // The first 128 bytes (hardwareInterferenceSize * 2) will contain the head
+    // and tail. They are padded to prevent false sharing.
+    int bufSize =
+        (capacity_ + 1) * sizeof(Slot<T>) + hardwareInterferenceSize * 2;
+    auto shmData = allocator_.allocate(bufSize);
+    head_ = (std::atomic<size_t> *)(shmData);
+    tail_ =
+        (std::atomic<size_t> *)(((uint8_t *)head_) + hardwareInterferenceSize);
+    slots_ = (Slot<T> *)(((uint8_t *)tail_) + hardwareInterferenceSize);
+    if (allocator.Mode() == shm::Mode_e::ALLOCATE) {
+      // Allocators are not required to honor alignment for over-aligned types
+      // (see http://eel.is/c++draft/allocator.requirements#10) so we verify
+      // alignment here
+      if (reinterpret_cast<size_t>(slots_) % alignof(Slot<T>) != 0) {
+        allocator_.deallocate();
+        throw std::bad_alloc();
+      }
+      for (size_t i = 0; i < capacity_; ++i) {
+        new (&slots_[i]) Slot<T>();
+      }
     }
-    for (size_t i = 0; i < capacity_; ++i) {
-      new (&slots_[i]) Slot<T>();
-    }
+
     static_assert(
         alignof(Slot<T>) == hardwareInterferenceSize,
         "Slot must be aligned to cache line boundary to prevent false sharing");
@@ -156,7 +169,7 @@ public:
     for (size_t i = 0; i < capacity_; ++i) {
       slots_[i].~Slot();
     }
-    allocator_.deallocate(slots_, capacity_ + 1);
+    allocator_.deallocate();
   }
 
   // non-copyable and non-movable
@@ -166,7 +179,7 @@ public:
   template <typename... Args> void emplace(Args &&...args) noexcept {
     static_assert(std::is_nothrow_constructible<T, Args &&...>::value,
                   "T must be nothrow constructible with Args&&...");
-    auto const head = head_.fetch_add(1);
+    auto const head = head_->fetch_add(1);
     auto &slot = slots_[idx(head)];
     while (turn(head) * 2 != slot.turn.load(std::memory_order_acquire))
       ;
@@ -177,18 +190,18 @@ public:
   template <typename... Args> bool try_emplace(Args &&...args) noexcept {
     static_assert(std::is_nothrow_constructible<T, Args &&...>::value,
                   "T must be nothrow constructible with Args&&...");
-    auto head = head_.load(std::memory_order_acquire);
+    auto head = head_->load(std::memory_order_acquire);
     for (;;) {
       auto &slot = slots_[idx(head)];
       if (turn(head) * 2 == slot.turn.load(std::memory_order_acquire)) {
-        if (head_.compare_exchange_strong(head, head + 1)) {
+        if (head_->compare_exchange_strong(head, head + 1)) {
           slot.construct(std::forward<Args>(args)...);
           slot.turn.store(turn(head) * 2 + 1, std::memory_order_release);
           return true;
         }
       } else {
         auto const prevHead = head;
-        head = head_.load(std::memory_order_acquire);
+        head = head_->load(std::memory_order_acquire);
         if (head == prevHead) {
           return false;
         }
@@ -223,7 +236,7 @@ public:
   }
 
   void pop(T &v) noexcept {
-    auto const tail = tail_.fetch_add(1);
+    auto const tail = tail_->fetch_add(1);
     auto &slot = slots_[idx(tail)];
     while (turn(tail) * 2 + 1 != slot.turn.load(std::memory_order_acquire))
       ;
@@ -233,11 +246,11 @@ public:
   }
 
   bool try_pop(T &v) noexcept {
-    auto tail = tail_.load(std::memory_order_acquire);
+    auto tail = tail_->load(std::memory_order_acquire);
     for (;;) {
       auto &slot = slots_[idx(tail)];
       if (turn(tail) * 2 + 1 == slot.turn.load(std::memory_order_acquire)) {
-        if (tail_.compare_exchange_strong(tail, tail + 1)) {
+        if (tail_->compare_exchange_strong(tail, tail + 1)) {
           v = slot.move();
           slot.destroy();
           slot.turn.store(turn(tail) * 2 + 2, std::memory_order_release);
@@ -245,7 +258,7 @@ public:
         }
       } else {
         auto const prevTail = tail;
-        tail = tail_.load(std::memory_order_acquire);
+        tail = tail_->load(std::memory_order_acquire);
         if (tail == prevTail) {
           return false;
         }
@@ -259,14 +272,16 @@ public:
   /// effort guess until all reader and writer threads have been joined.
   ptrdiff_t size() const noexcept {
     // TODO: How can we deal with wrapped queue on 32bit?
-    return static_cast<ptrdiff_t>(head_.load(std::memory_order_relaxed) -
-                                  tail_.load(std::memory_order_relaxed));
+    return static_cast<ptrdiff_t>(head_->load(std::memory_order_relaxed) -
+                                  tail_->load(std::memory_order_relaxed));
   }
 
   /// Returns true if the queue is empty.
   /// Since this is a concurrent queue this is only a best effort guess
   /// until all reader and writer threads have been joined.
   bool empty() const noexcept { return size() <= 0; }
+
+  const std::string Name() const noexcept { return allocator_.Name(); }
 
 private:
   constexpr size_t idx(size_t i) const noexcept { return i % capacity_; }
@@ -283,8 +298,8 @@ private:
 #endif
 
   // Align to avoid false sharing between head_ and tail_
-  alignas(hardwareInterferenceSize) std::atomic<size_t> head_;
-  alignas(hardwareInterferenceSize) std::atomic<size_t> tail_;
+  alignas(hardwareInterferenceSize) std::atomic<size_t> *head_;
+  alignas(hardwareInterferenceSize) std::atomic<size_t> *tail_;
 };
 } // namespace mpmc
 

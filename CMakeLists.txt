@@ -69,3 +69,26 @@ if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
         DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/${PROJECT_NAME}"
     )
 endif()
+
+if(${BUILD_RIGTORP})
+  message("'BUILD_RIGTORP' flag detected; the server will build custom rigtorp test programs")
+
+    # server program
+    add_executable(rigtorp
+      rigtorp.cpp
+    )
+
+    target_link_libraries(rigtorp PUBLIC
+      MPMCQueue
+    )
+
+    # client program
+    add_executable(rigtorp-client
+      rigtorp-client.cpp
+    )
+
+    target_link_libraries(rigtorp-client PUBLIC
+      MPMCQueue
+    )
+
+endif()
